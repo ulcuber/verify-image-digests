@@ -1,0 +1,198 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# Check dependencies
+command -v jq >/dev/null 2>&1 || { echo >&2 "jq required but not found. Aborting."; exit 1; }
+command -v docker >/dev/null 2>&1 || { echo >&2 "docker required but not found. Aborting."; exit 1; }
+
+# Check if image name is provided
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 <image-name> [manifest-digest]"
+    exit 1
+fi
+
+IMAGE_NAME=$1
+ROOT_DIGEST=${2:-}
+TEMP_DIR=$(mktemp -d)
+declare -A VERIFIED_DIGESTS=()
+OFFSET=""
+
+cleanup() {
+    echo "Cleaning '$TEMP_DIR'"
+    rm -rf "$TEMP_DIR"
+}
+trap cleanup EXIT
+
+get_docker_root_digest() {
+    local image=$1
+    local digest
+
+    # distribution.manifest.list digest
+    digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$image" 2>/dev/null | cut -d'@' -f2)
+
+    # config digest
+    [ -z "$digest" ] && digest=$(docker inspect --format='{{.Id}}' "$image")
+    [ -z "$digest" ] && { echo "Error: Failed to get digest"; exit 1; }
+    
+    echo "$digest"
+}
+
+save_image() {
+    docker save "$1" -o "$TEMP_DIR/image.tar"
+    sha256sum "$TEMP_DIR/image.tar"
+    tar -xf "$TEMP_DIR/image.tar" -C "$TEMP_DIR"
+}
+
+get_digest() {
+    local algorithm="$1"
+    local file_path="$2"
+
+    local actual_digest=""
+
+    case $algorithm in
+        sha256) actual_digest=$(sha256sum "$file_path" | awk '{print "sha256:"$1}') ;;
+        *) echo "Unsupported algorithm: $algorithm"; return 1 ;;
+    esac
+
+    echo "$actual_digest"
+}
+
+verify_digest() {
+    local digest=$1
+    local file_path=$2
+    local expected_type=$3
+
+    [ "${VERIFIED_DIGESTS[$digest]+_}" ] && return 0
+
+    echo "${OFFSET}Verifying $expected_type: $digest"
+
+    local actual_digest
+    local algorithm=${digest%%:*}
+    actual_digest=$(get_digest "$algorithm" "$file_path")
+
+    [ "$actual_digest" != "$digest" ] && {
+        echo "${OFFSET}Digest mismatch for $file_path"
+        echo "${OFFSET}Expected: $digest"
+        echo "${OFFSET}Actual:   $actual_digest"
+        jq -r '.' "$file_path"
+        return 1
+    }
+
+    VERIFIED_DIGESTS[$digest]=1
+}
+
+process_manifest() {
+    local digest="$1"
+    local manifest_path
+
+    OFFSET="$OFFSET  "
+
+    manifest_path="$TEMP_DIR/blobs/${digest//://}"
+    if [ ! -s "$manifest_path" ]; then
+        manifest_path="$TEMP_DIR/manifest-inspect-${#OFFSET}.json"
+        docker manifest inspect "${IMAGE_NAME}@${digest}" > "$manifest_path"
+        if [ ! -s "$manifest_path" ]; then
+            manifest_path=""
+            digest=""
+            if [ -s "$TEMP_DIR/index.json" ]; then
+                manifest_path="$TEMP_DIR/index.json"
+            elif [ -s "$TEMP_DIR/manifest.json" ]; then
+                manifest_path="$TEMP_DIR/manifest.json"
+            fi
+        fi
+    fi
+    if [ ! -s "$manifest_path" ]; then
+        echo "No manifest found"
+        exit 1
+    fi
+    echo "${OFFSET}Using: $manifest_path"
+
+    local mediaType
+    mediaType=$(jq -r '.mediaType' "$manifest_path")
+    case "$mediaType" in
+        "application/vnd.docker.distribution.manifest.list.v2+json")
+            perl -i -pe 'chomp if eof' "$manifest_path"
+            verify_digest "$digest" "$manifest_path" "vnd.docker.distribution.manifest.list.v2"
+
+            local image_os
+            local image_arch
+            image_os=$(docker inspect --format='{{.Os}}' "${IMAGE_NAME}@${ROOT_DIGEST}")
+            image_arch=$(docker inspect --format='{{.Architecture}}' "${IMAGE_NAME}@${ROOT_DIGEST}")
+            jq -r \
+              --arg os "$image_os" \
+              --arg arch "$image_arch" \
+              '
+              .manifests[] | 
+              select(
+                .platform.os == $os and 
+                .platform.architecture == $arch
+              ).digest
+              ' "$manifest_path" | while read -r sub_digest; do
+                process_manifest "$sub_digest"
+            done
+        ;;
+        "application/vnd.docker.distribution.manifest.v2+json")
+            # TODO: canonicalize?
+            # verify_digest "$digest" "$manifest_path" "$mediaType"
+
+            local config_digest
+            config_digest=$(jq -r '.config.digest' "$manifest_path")
+            process_manifest "$config_digest"
+
+            # layers could be gzipped. Though they are processed using config
+            ;;
+        "application/vnd.oci.image.manifest.v1+json")
+            if [ -n "$digest" ]; then
+                verify_digest "$digest" "$manifest_path" "$mediaType"
+            fi
+
+            local config_digest
+            config_digest=$(jq -r '.config.digest' "$manifest_path")
+            local config_file="$TEMP_DIR/blobs/${config_digest//://}"
+            jq -r '.' "$config_file"
+            verify_digest "$config_digest" "$config_file" "config"
+
+            jq -r '.layers[].digest' "$manifest_path" | while read -r layer; do
+                local layer_file="$TEMP_DIR/blobs/${layer//://}"
+                verify_digest "$layer" "$layer_file" "layer"
+            done
+            ;;
+        "application/vnd.oci.image.index.v1+json")
+            if [ -n "$digest" ]; then
+                verify_digest "$digest" "$manifest_path" "vnd.oci.image.index.v1"
+            fi
+
+            jq -r '.manifests[].digest' "$manifest_path" | while read -r digest; do
+                process_manifest "$digest"
+            done
+            ;;
+        "null")
+            verify_digest "$digest" "$manifest_path" "config"
+
+            jq -r '.rootfs.diff_ids[]' "$manifest_path" | while read -r layer; do
+                local layer_file="$TEMP_DIR/blobs/${layer//://}"
+                verify_digest "$layer" "$layer_file" "layer"
+            done
+            ;;
+        *)
+            echo "Unsupported mediaType: $mediaType"
+            jq -r '.' "$manifest_path"
+            exit 1
+            ;;
+    esac
+}
+
+echo "Saving image '$IMAGE_NAME' to '$TEMP_DIR'"
+save_image "$IMAGE_NAME"
+
+if [ -n "$ROOT_DIGEST" ]; then
+    echo "argument root digest: $ROOT_DIGEST"
+else
+    ROOT_DIGEST=$(get_docker_root_digest "$IMAGE_NAME")
+    echo "docker inspect root digest: $ROOT_DIGEST"
+fi
+
+echo "Verifying image $IMAGE_NAME with root digest: $ROOT_DIGEST"
+process_manifest "$ROOT_DIGEST"
+echo "All digests verified successfully!"
